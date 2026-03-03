@@ -1,0 +1,587 @@
+name: Test Installation
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint:
+    name: Format and Lint
+    runs-on: ubuntu-latest
+    env:
+      NO_COLOR: 1
+      CARGO_TERM_COLOR: never
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    - name: Check formatting
+      id: fmt
+      run: |
+        if cargo fmt --all -- --check; then
+          echo "✅ Formatting OK" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ Formatting failed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### How to fix:" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "cargo fmt --all" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "::error::Formatting check failed. Run: cargo fmt --all"
+          exit 1
+        fi
+
+    - name: Run clippy
+      id: clippy
+      run: |
+        if cargo clippy --all-targets --all-features -- -D warnings -A clippy::needless_borrows_for_generic_args; then
+          echo "✅ Clippy clean" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ Clippy failed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### How to fix:" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "cargo clippy --all-targets --all-features -- -D warnings" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "::error::Clippy found issues. Run: cargo clippy --all-targets --all-features -- -D warnings"
+          exit 1
+        fi
+
+    - name: Lint summary
+      if: always()
+      run: |
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "---" >> $GITHUB_STEP_SUMMARY
+        echo "📚 See [CONTRIBUTING.md](../../blob/main/CONTRIBUTING.md#ci) for local reproduction" >> $GITHUB_STEP_SUMMARY
+
+  test-matrix:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        mode: [default, git_pv2]
+        include:
+          - mode: default
+            features: ""
+            desc: "Default features"
+          - mode: git_pv2
+            features: "--features git_porcelain_v2"
+            desc: "Git Porcelain v2"
+
+    env:
+      NO_COLOR: 1  # Ensure deterministic output for tests
+      CARGO_TERM_COLOR: never  # Disable cargo color output for consistent logs
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.mode }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}-
+          ${{ runner.os }}-cargo-registry-
+
+    - name: Cache cargo git index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.mode }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}-
+          ${{ runner.os }}-cargo-git-
+
+    - name: Cache target directory
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.mode }}
+        restore-keys: |
+          ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
+          ${{ runner.os }}-target-
+
+    - name: Run tests (${{ matrix.desc }})
+      id: test
+      run: |
+        start_time=$(date +%s)
+
+        # Run tests and capture output
+        if cargo test ${{ matrix.features }} --all-targets 2>&1 | tee test_output.txt; then
+          test_result="✅ PASSED"
+          test_status=0
+        else
+          test_result="❌ FAILED"
+          test_status=1
+        fi
+
+        end_time=$(date +%s)
+        duration=$((end_time - start_time))
+
+        # Extract test count (sum all test suites)
+        test_count=$(grep -E "test result:" test_output.txt | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+" | awk '{s+=$1} END {print s+0}' | head -1 || echo "0")
+        failed_count=$(grep -E "test result:" test_output.txt | grep -oE "[0-9]+ failed" | grep -oE "[0-9]+" | awk '{s+=$1} END {print s+0}' | head -1 || echo "0")
+
+        # Ensure we have valid numbers (remove any whitespace/newlines)
+        test_count=$(echo "$test_count" | tr -d '\n\r' | xargs)
+        failed_count=$(echo "$failed_count" | tr -d '\n\r' | xargs)
+        test_count=${test_count:-0}
+        failed_count=${failed_count:-0}
+
+        # Set outputs for step summary
+        echo "result=$test_result" >> $GITHUB_OUTPUT
+        echo "duration=$duration" >> $GITHUB_OUTPUT
+        echo "test_count=$test_count" >> $GITHUB_OUTPUT
+        echo "failed_count=$failed_count" >> $GITHUB_OUTPUT
+        echo "status=$test_status" >> $GITHUB_OUTPUT
+
+        exit $test_status
+
+    - name: Generate test summary
+      if: always()
+      run: |
+        cat >> $GITHUB_STEP_SUMMARY << EOF
+        ## Test Results: ${{ matrix.desc }}
+
+        | Metric | Value |
+        |--------|-------|
+        | Status | ${{ steps.test.outputs.result }} |
+        | Duration | ${{ steps.test.outputs.duration }}s |
+        | Tests Passed | ${{ steps.test.outputs.test_count }} |
+        | Tests Failed | ${{ steps.test.outputs.failed_count }} |
+        | Feature Mode | ${{ matrix.desc }} |
+        | Rust Version | $(rustc --version) |
+
+        EOF
+
+        if [ "${{ steps.test.outputs.status }}" != "0" ]; then
+          echo "### Failed Test Output" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep -A 5 "FAILED" test_output.txt | head -50 >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "📚 See [CONTRIBUTING.md](../../blob/main/CONTRIBUTING.md#ci) for local reproduction" >> $GITHUB_STEP_SUMMARY
+
+  test-scripts:
+    runs-on: ubuntu-latest
+    env:
+      NO_COLOR: 1
+      CARGO_TERM_COLOR: never
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y jq curl patch make
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Test install script help
+      run: ./scripts/install-statusline.sh --help
+
+    - name: Test uninstall script help
+      run: ./scripts/uninstall-statusline.sh --help
+
+    - name: Test dry-run installation
+      run: ./scripts/install-statusline.sh --dry-run --verbose
+
+    - name: Build the binary first
+      run: cargo build --release
+
+    - name: Test installation with custom prefix
+      run: |
+        mkdir -p /tmp/test-install /tmp/test-config
+        ./scripts/install-statusline.sh --test --prefix /tmp/test-install --config-dir /tmp/test-config --skip-build
+
+    - name: Verify installation
+      run: |
+        test -f /tmp/test-install/statusline
+        # Note: settings.json might not exist if this is a fresh config dir
+        # The install script creates settings.local.json for new installations
+        test -f /tmp/test-config/settings.json || test -f /tmp/test-config/settings.local.json
+
+    - name: Test statusline binary
+      run: |
+        echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Claude Sonnet"}}' | /tmp/test-install/statusline
+
+    - name: Test uninstallation
+      run: |
+        ./scripts/uninstall-statusline.sh --test --prefix /tmp/test-install --config-dir /tmp/test-config
+
+    - name: Verify uninstallation
+      run: |
+        ! test -f /tmp/test-install/statusline
+
+  test-build:
+    runs-on: ubuntu-latest
+    env:
+      NO_COLOR: 1
+      CARGO_TERM_COLOR: never
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y make
+
+    - name: Build project
+      run: |
+        make clean
+        make build
+
+    - name: Test binary output
+      run: |
+        # Test empty input
+        echo '{}' | ./target/release/statusline
+
+        # Test with workspace
+        echo '{"workspace":{"current_dir":"/home/test"}}' | ./target/release/statusline
+
+        # Test with model
+        echo '{"model":{"display_name":"Claude Opus"}}' | ./target/release/statusline
+
+        # Test with cost and progress
+        cat > /tmp/test.jsonl << 'EOF'
+        {"message":{"role":"assistant","content":"test","usage":{"input_tokens":50000,"output_tokens":10000}},"timestamp":"2025-08-22T18:00:00.000Z"}
+        {"message":{"role":"user","content":"question"},"timestamp":"2025-08-22T18:05:00.000Z"}
+        EOF
+        echo '{"workspace":{"current_dir":"/tmp"},"model":{"display_name":"Claude Sonnet"},"transcript":"/tmp/test.jsonl","cost":{"total_cost_usd":10.50}}' | ./target/release/statusline
+
+        # Test version flag
+        ./target/release/statusline --version
+
+        # Test help flag
+        ./target/release/statusline --help
+
+    - name: Run tests
+      id: test
+      run: |
+        start_time=$(date +%s)
+
+        if make test; then
+          test_result="✅ PASSED"
+          test_status=0
+        else
+          test_result="❌ FAILED"
+          test_status=1
+        fi
+
+        end_time=$(date +%s)
+        duration=$((end_time - start_time))
+
+        echo "result=$test_result" >> $GITHUB_OUTPUT
+        echo "duration=$duration" >> $GITHUB_OUTPUT
+        echo "status=$test_status" >> $GITHUB_OUTPUT
+
+        exit $test_status
+
+    - name: Check binary size
+      run: |
+        size=$(stat -c%s target/release/statusline)
+        echo "Binary size: $size bytes"
+        # Fail if binary is larger than 8MB (includes bundled SQLite, TOML parser, theme system)
+        if [ $size -gt 8388608 ]; then
+          echo "Binary too large! Expected < 8MB"
+          exit 1
+        fi
+
+        # Add to step summary
+        cat >> $GITHUB_STEP_SUMMARY << EOF
+        ## Build Results
+
+        | Metric | Value |
+        |--------|-------|
+        | Binary Size | $(($size / 1024 / 1024))MB ($(($size / 1024))KB) |
+        | Build Type | Release |
+        | Max Allowed | 8MB |
+        | Test Status | ${{ steps.test.outputs.result }} |
+        | Test Duration | ${{ steps.test.outputs.duration }}s |
+        | Rust Version | $(rustc --version) |
+
+        EOF
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "📚 See [README.md](../../blob/main/README.md) for quick start" >> $GITHUB_STEP_SUMMARY
+
+  test-sqlite:
+    runs-on: ubuntu-latest
+    env:
+      NO_COLOR: 1
+      CARGO_TERM_COLOR: never
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Build project
+      run: cargo build --release
+
+    - name: Test SQLite dual-write functionality
+      run: |
+        # Create test data directory
+        export XDG_DATA_HOME=/tmp/test-data
+        mkdir -p $XDG_DATA_HOME/claudia-statusline
+
+        # Run statusline with cost data to trigger dual-write
+        echo '{"workspace":{"current_dir":"/tmp"},"session_id":"test-sqlite-ci","cost":{"total_cost_usd":10.50,"total_lines_added":500,"total_lines_removed":100}}' | ./target/release/statusline
+
+        # Verify both files exist
+        test -f $XDG_DATA_HOME/claudia-statusline/stats.json
+        test -f $XDG_DATA_HOME/claudia-statusline/stats.db
+
+        # Verify JSON contains the session
+        grep -q "test-sqlite-ci" $XDG_DATA_HOME/claudia-statusline/stats.json
+
+        # Verify SQLite database is valid
+        sqlite3 $XDG_DATA_HOME/claudia-statusline/stats.db "SELECT COUNT(*) FROM sessions WHERE session_id='test-sqlite-ci';" | grep -q "1"
+
+    - name: Test concurrent SQLite access
+      run: |
+        export XDG_DATA_HOME=/tmp/test-data
+
+        # Run 5 concurrent statusline processes
+        for i in {1..5}; do
+          echo '{"workspace":{"current_dir":"/tmp"},"session_id":"concurrent-'$i'","cost":{"total_cost_usd":'$i'.50}}' | ./target/release/statusline &
+        done
+
+        # Wait for all to complete
+        wait
+
+        # Verify all sessions were written
+        for i in {1..5}; do
+          sqlite3 $XDG_DATA_HOME/claudia-statusline/stats.db "SELECT COUNT(*) FROM sessions WHERE session_id='concurrent-$i';" | grep -q "1"
+        done
+
+    - name: Test SQLite migration from existing JSON
+      run: |
+        export XDG_DATA_HOME=/tmp/test-migration
+        mkdir -p $XDG_DATA_HOME/claudia-statusline
+
+        # Create a pre-existing JSON stats file
+        cat > $XDG_DATA_HOME/claudia-statusline/stats.json << 'EOF'
+        {
+          "version": "1.0",
+          "created": "2025-08-25T00:00:00Z",
+          "last_updated": "2025-08-25T01:00:00Z",
+          "sessions": {
+            "existing-session": {
+              "last_updated": "2025-08-25T01:00:00Z",
+              "cost": 25.0,
+              "lines_added": 1000,
+              "lines_removed": 200,
+              "start_time": "2025-08-25T00:00:00Z"
+            }
+          },
+          "daily": {},
+          "monthly": {},
+          "all_time": {
+            "total_cost": 25.0,
+            "sessions": 1,
+            "since": "2025-08-25T00:00:00Z"
+          }
+        }
+        EOF
+
+        # Run statusline to trigger migration
+        echo '{"workspace":{"current_dir":"/tmp"},"session_id":"new-session","cost":{"total_cost_usd":5.0}}' | ./target/release/statusline
+
+        # Verify SQLite database was created
+        test -f $XDG_DATA_HOME/claudia-statusline/stats.db
+
+        # Brief pause to allow database connection to close
+        sleep 0.5
+
+        # Verify both sessions exist in SQLite
+        session_count=$(sqlite3 $XDG_DATA_HOME/claudia-statusline/stats.db "SELECT COUNT(*) FROM sessions;")
+        if [ "$session_count" != "2" ]; then
+          echo "ERROR: Expected 2 sessions, got $session_count"
+          echo "=== Sessions in database ==="
+          sqlite3 $XDG_DATA_HOME/claudia-statusline/stats.db "SELECT session_id, cost FROM sessions;"
+          exit 1
+        fi
+        echo "✅ Migration test passed: 2 sessions found in database"
+
+  test-features:
+    runs-on: ubuntu-latest
+    env:
+      NO_COLOR: 1
+      CARGO_TERM_COLOR: never
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Build project
+      run: cargo build --release
+
+    - name: Test context progress bar
+      run: |
+        # Create test transcript with high token usage
+        cat > /tmp/high-usage.jsonl << 'EOF'
+        {"message":{"role":"assistant","content":"test","usage":{"input_tokens":120000,"output_tokens":5000}},"timestamp":"2025-08-22T18:00:00.000Z"}
+        {"message":{"role":"user","content":"question"},"timestamp":"2025-08-22T18:05:00.000Z"}
+        EOF
+        output=$(echo '{"workspace":{"current_dir":"/tmp"},"transcript":"/tmp/high-usage.jsonl"}' | ./target/release/statusline)
+        # Context window = input_tokens only (120000), not output_tokens
+        # 120000/200000 = 60%
+        if ! echo "$output" | grep -q "60%"; then
+          echo "Context percentage not showing correctly"
+          echo "Output: $output"
+          exit 1
+        fi
+
+    - name: Test burn rate calculation
+      run: |
+        # Create test transcript with timestamps
+        cat > /tmp/burn-test.jsonl << 'EOF'
+        {"message":{"role":"assistant","content":"test","usage":{"input_tokens":10000,"output_tokens":1000}},"timestamp":"2025-08-22T18:00:00.000Z"}
+        {"message":{"role":"user","content":"question"},"timestamp":"2025-08-22T18:05:00.000Z"}
+        EOF
+        output=$(echo '{"workspace":{"current_dir":"/tmp"},"transcript":"/tmp/burn-test.jsonl","cost":{"total_cost_usd":5.00}}' | ./target/release/statusline)
+        if ! echo "$output" | grep -q "/hr"; then
+          echo "Burn rate not showing"
+          exit 1
+        fi
+
+    - name: Test cache tokens support
+      run: |
+        # Create test transcript with cache tokens
+        cat > /tmp/cache-test.jsonl << 'EOF'
+        {"message":{"role":"assistant","content":"test","usage":{"input_tokens":100,"cache_read_input_tokens":30000,"cache_creation_input_tokens":200,"output_tokens":500}},"timestamp":"2025-08-22T18:00:00.000Z"}
+        EOF
+        output=$(echo '{"workspace":{"current_dir":"/tmp"},"transcript":"/tmp/cache-test.jsonl"}' | ./target/release/statusline)
+        # Updated for 200k context window: 30800/200000 = 15.4% (was 19% with 160k window)
+        if ! echo "$output" | grep -q "15%"; then
+          echo "Cache tokens not calculated correctly"
+          echo "Output: $output"
+          exit 1
+        fi
+
+    - name: Test array content support
+      run: |
+        # Create test transcript with array content
+        cat > /tmp/array-test.jsonl << 'EOF'
+        {"message":{"role":"assistant","content":[{"type":"text","text":"response"}],"usage":{"input_tokens":50000,"output_tokens":1000}},"timestamp":"2025-08-22T18:00:00.000Z"}
+        EOF
+        output=$(echo '{"workspace":{"current_dir":"/tmp"},"transcript":"/tmp/array-test.jsonl"}' | ./target/release/statusline)
+        # Context window = input_tokens only (50000), not output_tokens
+        # 50000/200000 = 25%
+        if ! echo "$output" | grep -q "25%"; then
+          echo "Array content not handled correctly"
+          echo "Output: $output"
+          exit 1
+        fi
+
+    - name: Test session ID with empty cost
+      run: |
+        # Test that statusline doesn't crash with session_id and empty cost
+        output=$(echo '{"workspace":{"current_dir":"/tmp"},"session_id":"test-123","cost":{}}' | ./target/release/statusline)
+        if [ $? -ne 0 ]; then
+          echo "Failed with session_id and empty cost"
+          exit 1
+        fi
+        echo "Output: $output"
+
+  # Dedicated job for isolated integration tests that require specific config
+  # These tests are marked #[ignore] in the default suite to avoid config conflicts
+  test-isolated:
+    name: Isolated Integration Tests
+    runs-on: ubuntu-latest
+    env:
+      NO_COLOR: 1
+      CARGO_TERM_COLOR: never
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}-isolated
+        restore-keys: |
+          ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}-
+          ${{ runner.os }}-cargo-registry-
+
+    - name: Cache target directory
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-isolated
+        restore-keys: |
+          ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
+          ${{ runner.os }}-target-
+
+    - name: Run isolated token rate tests
+      id: isolated_test
+      run: |
+        echo "## Isolated Integration Tests" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "These tests require specific config (json_backup=false) and run in isolation." >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        start_time=$(date +%s)
+
+        # Run ignored tests in isolation - they get a fresh config state
+        if cargo test --test token_rate_basic_test -- --ignored 2>&1 | tee isolated_output.txt; then
+          test_result="✅ PASSED"
+          test_status=0
+        else
+          test_result="❌ FAILED"
+          test_status=1
+        fi
+
+        end_time=$(date +%s)
+        duration=$((end_time - start_time))
+
+        # Extract test count
+        test_count=$(grep -E "test result:" isolated_output.txt | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+" | head -1 || echo "0")
+        test_count=${test_count:-0}
+
+        echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Status | $test_result |" >> $GITHUB_STEP_SUMMARY
+        echo "| Tests Passed | $test_count |" >> $GITHUB_STEP_SUMMARY
+        echo "| Duration | ${duration}s |" >> $GITHUB_STEP_SUMMARY
+        echo "| Test File | \`token_rate_basic_test.rs\` |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        if [ $test_status -ne 0 ]; then
+          echo "### Test Output" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -50 isolated_output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "ℹ️ These tests are \`#[ignore]\` in the default suite due to OnceLock config caching." >> $GITHUB_STEP_SUMMARY
+        echo "Run locally with: \`cargo test --test token_rate_basic_test -- --ignored\`" >> $GITHUB_STEP_SUMMARY
+
+        exit $test_status

@@ -1,0 +1,37 @@
+# Build artifacts
+/target/
+.cargo/
+# Note: Cargo.lock is tracked for reproducible builds (binary application)
+
+# Archive directory for old patch-based approach
+/archive/
+
+# Claude-specific files (local development context)
+CLAUDE.md
+AGENTS.md
+.claude/
+
+# Temporary files
+*.tmp
+
+# Backup files
+*.orig
+*.bak
+*~
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# workspaces
+*.code-workspace
+
+# OAuth/callback files (accidental commits)
+callback*
+*callback?code=*

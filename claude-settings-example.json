@@ -1,0 +1,7 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "~/.local/bin/statusline",
+    "padding": 0
+  }
+}

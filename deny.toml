@@ -1,0 +1,48 @@
+# cargo-deny configuration for Claudia Statusline
+# This file configures supply chain security checks
+# cargo-deny TOML configuration file
+
+[bans]
+# Warn about multiple versions of the same crate
+multiple-versions = "warn"
+# Crates to skip when checking for duplicates
+skip = []
+skip-tree = []
+
+[licenses]
+# Allow only these licenses (permissive)
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "Unlicense",
+]
+# Confidence threshold for license detection
+confidence-threshold = 0.8
+# List of exceptions for specific crates
+exceptions = []
+
+[sources]
+# Warn about crates from unknown registries
+unknown-registry = "warn"
+# Warn about crates from unknown git sources
+unknown-git = "warn"
+
+[advisories]
+# Path to the advisory database
+db-path = "~/.cargo/advisory-db"
+# URLs to advisory databases
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Warn about yanked crates
+yanked = "warn"
+# Ignore specific advisories (use sparingly)
+ignore = [
+    # Example: "RUSTSEC-2020-0001",
+]

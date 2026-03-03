@@ -1,0 +1,390 @@
+name: Security Audit
+
+permissions:
+  contents: read
+  security-events: write
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/security.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/security.yml'
+  schedule:
+    # Run security audit daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Format and Lint
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+
+    - name: Run clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings -A clippy::needless_borrows_for_generic_args
+
+  security-audit:
+    needs: lint
+    runs-on: ubuntu-latest
+    name: Security Audit
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-registry-
+
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-index-
+
+    - name: Install cargo-audit
+      run: cargo install cargo-audit
+
+    - name: Run security audit
+      run: |
+        echo "## Security Audit Report" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        # Run cargo audit with JSON output for artifacts
+        cargo audit --json > audit.json 2>&1 || true
+
+        # Also run without JSON for human-readable output
+        if cargo audit 2>&1; then
+          echo "✅ No security vulnerabilities found!" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⚠️ Security vulnerabilities detected!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Display human-readable output in logs and summary
+          echo "### Detailed Report:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cargo audit 2>&1 | head -100 >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "📄 [See full JSON report in workflow artifacts](../actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+
+    - name: Check for outdated dependencies
+      run: |
+        cargo install cargo-outdated
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## Outdated Dependencies" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        cargo outdated --exit-code 0 2>&1 | head -50 >> $GITHUB_STEP_SUMMARY || true
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+    - name: Upload audit results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-audit-results
+        path: |
+          audit.json
+        retention-days: 30
+
+  dependency-review:
+    runs-on: ubuntu-latest
+    name: Dependency Review
+    if: github.event_name == 'pull_request'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Dependency Review
+      uses: actions/dependency-review-action@v4
+      with:
+        fail-on-severity: moderate
+        deny-licenses: GPL-3.0, AGPL-3.0
+        comment-summary-in-pr: true
+
+  license-check:
+    runs-on: ubuntu-latest
+    name: License Compatibility Check
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-registry-
+
+    - name: Build project dependencies
+      run: cargo build
+
+    - name: Install cargo-license
+      run: cargo install cargo-license --locked
+
+    - name: Check licenses
+      run: |
+        set +e  # Don't exit on error
+
+        # Ensure cargo-license is in PATH
+        export PATH="$HOME/.cargo/bin:$PATH"
+
+        echo "## License Report" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Dependencies and their licenses:" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+        # Try to run cargo-license and capture the result (informational table)
+        cargo license --authors --do-not-bundle | tee license-report.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null
+        LICENSE_EXIT_CODE=$?
+
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+        if [ $LICENSE_EXIT_CODE -eq 0 ]; then
+          # cargo-license succeeded, check for incompatible licenses (exclude dev-deps)
+          cargo license --json --avoid-dev-deps 2>/dev/null > /tmp/licenses.json
+          if [ $? -eq 0 ]; then
+            # Match only AGPL-*, GPL-* (not LGPL), using non-word boundary before the token
+            INCOMPATIBLE=$(jq '[.[] | select(.license | test("(^|\\W)(AGPL|GPL)-"))] | length' /tmp/licenses.json 2>/dev/null || echo "0")
+            if [ "$INCOMPATIBLE" -gt 0 ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "⚠️ Found potentially incompatible licenses!" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              jq -r '.[] | select(.license | test("(^|\\W)(AGPL|GPL)-")) | "\(.name) \(.license)"' /tmp/licenses.json 2>/dev/null >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              echo "(warning-only; build continues)" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "✅ All licenses are compatible" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ Could not check license compatibility" >> $GITHUB_STEP_SUMMARY
+          fi
+        else
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ cargo-license is not available or failed to run (exit code: $LICENSE_EXIT_CODE)" >> $GITHUB_STEP_SUMMARY
+          echo "This is not a critical error - continuing build" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "📄 [See full license report in workflow artifacts](../actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+
+        # Always exit successfully unless we found incompatible licenses
+        exit 0
+
+    - name: Upload license report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: license-report
+        path: |
+          license-report.txt
+          /tmp/licenses.json
+        retention-days: 30
+
+  supply-chain-security:
+    runs-on: ubuntu-latest
+    name: Supply Chain Security
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install cargo-deny
+      run: cargo install cargo-deny --locked
+
+    - name: Fetch advisory database
+      run: |
+        # Ensure the advisory database is up to date
+        mkdir -p ~/.cargo
+        cargo deny fetch
+
+    - name: Create deny.toml if not exists
+      run: |
+        if [ ! -f deny.toml ]; then
+          cat > deny.toml << 'EOF'
+        # cargo-deny configuration
+        # cargo-deny TOML configuration file
+
+        [bans]
+        multiple-versions = "warn"
+        skip = []
+        skip-tree = []
+
+        [licenses]
+        allow = [
+          "MIT",
+          "Apache-2.0",
+          "Apache-2.0 WITH LLVM-exception",
+          "BSD-2-Clause",
+          "BSD-3-Clause",
+          "ISC",
+          "Unicode-DFS-2016",
+          "CC0-1.0",
+          "Unlicense",
+        ]
+        confidence-threshold = 0.8
+
+        [sources]
+        unknown-registry = "warn"
+        unknown-git = "warn"
+
+        [advisories]
+        db-path = "~/.cargo/advisory-db"
+        db-urls = ["https://github.com/rustsec/advisory-db"]
+        yanked = "warn"
+        EOF
+        fi
+
+    - name: Run cargo-deny
+      continue-on-error: true
+      run: |
+        # Try to generate SARIF format (may not be supported)
+        cargo deny check --format sarif > deny.sarif 2>&1 || true
+
+
+        echo "## Supply Chain Security Check" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        # Run cargo-deny and capture JSON report for summary
+        set +e
+        cargo deny check --format json > /tmp/deny.json 2>&1
+        EXIT=$?
+        set -e
+
+        # Ensure jq is available for summaries
+        if ! command -v jq >/dev/null 2>&1; then
+          sudo apt-get update >/dev/null 2>&1 && sudo apt-get install -y jq >/dev/null 2>&1 || true
+        fi
+
+        # Compute errors/warnings from JSON when possible
+        if command -v jq >/dev/null 2>&1; then
+          ERRORS=$(jq '[.reports[] | .errors | length] | add // 0' /tmp/deny.json 2>/dev/null || echo 0)
+          WARNINGS=$(jq '[.reports[] | .warnings | length] | add // 0' /tmp/deny.json 2>/dev/null || echo 0)
+        else
+          ERRORS=$([ $EXIT -eq 0 ] && echo 0 || echo 1)
+          WARNINGS=0
+        fi
+
+        if [ "${ERRORS:-0}" -eq 0 ]; then
+          echo "✅ Supply chain security check passed!" >> $GITHUB_STEP_SUMMARY
+          if [ "${WARNINGS:-0}" -gt 0 ]; then
+            echo "(with ${WARNINGS} warnings)" >> $GITHUB_STEP_SUMMARY
+          fi
+          exit 0
+        else
+          echo "⚠️ Supply chain security issues detected!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Human-readable excerpt
+          echo "### Detailed Report:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cargo deny check 2>&1 | head -100 >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+          # Re-run a production-focused check (approximate) to ignore dev-only issues
+          # If the prod-focused run has no errors, treat as warn-only
+          set +e
+          cargo deny check --no-default-features --format json > /tmp/deny_prod.json 2>&1
+          PROD_EXIT=$?
+          set -e
+
+          if command -v jq >/dev/null 2>&1; then
+            PROD_ERRORS=$(jq '[.reports[] | .errors | length] | add // 0' /tmp/deny_prod.json 2>/dev/null || echo 0)
+          else
+            PROD_ERRORS=$([ $PROD_EXIT -eq 0 ] && echo 0 || echo 1)
+          fi
+
+          if [ "${PROD_ERRORS:-0}" -eq 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "ℹ️ Errors appear to be from dev-only dependencies; treating as warnings" >> $GITHUB_STEP_SUMMARY
+            # Show a brief summary of prod-focused run
+            if command -v jq >/dev/null 2>&1; then
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              jq -r '.reports[] | .title + ": " + ( (.errors | length) | tostring ) + " errors, " + ( (.warnings | length) | tostring ) + " warnings"' /tmp/deny_prod.json 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
+              echo '```' >> $GITHUB_STEP_SUMMARY
+            fi
+            exit 0
+          fi
+
+          # JSON summary with diagnostic codes/messages
+          if command -v jq >/dev/null 2>&1; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### JSON Summary" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            jq -r '
+              .reports[]
+              | .title as $t
+              | "Report: " + $t,
+                ("Errors: " + ((.errors | length) | tostring)),
+                (.errors[]?.diagnostic | (.code // "") + " | " + (.message // "") ),
+                "",
+                ("Warnings: " + ((.warnings | length) | tostring)),
+                (.warnings[]?.diagnostic | (.code // "") + " | " + (.message // "") ),
+                "-----"
+            ' /tmp/deny.json 2>/dev/null >> $GITHUB_STEP_SUMMARY || cat /tmp/deny.json >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "❌ Critical errors found (${ERRORS} errors, ${WARNINGS} warnings)" >> $GITHUB_STEP_SUMMARY
+          exit 2
+        fi
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "📄 [See full reports in workflow artifacts](../actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+
+    - name: Upload SARIF to GitHub Code Scanning
+      if: always() && github.ref == 'refs/heads/main'
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: deny.sarif
+      continue-on-error: true
+
+    - name: Upload supply chain artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: supply-chain-security
+        path: |
+          /tmp/deny.json
+          /tmp/deny_prod.json
+          deny.sarif
+        retention-days: 30

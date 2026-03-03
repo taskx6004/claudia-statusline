@@ -1,0 +1,77 @@
+[package]
+name = "statusline"
+version = "2.22.1"
+edition = "2021"
+license = "MIT"
+description = "Claudia Statusline - A feature-rich statusline for Claude Code, inspired by Peter Steinberger's statusline.rs"
+repository = "https://github.com/hagan/claudia-statusline"
+build = "build.rs"
+
+[features]
+default = []
+git_porcelain_v2 = []
+turso-sync = ["libsql", "tokio"]
+
+[lib]
+name = "statusline"
+path = "src/lib.rs"
+
+[[bin]]
+name = "statusline"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"  # TOML parsing and serialization
+chrono = { version = "0.4", features = ["serde"] }
+fs2 = "0.4"  # For file locking across processes
+rusqlite = { version = "0.31", features = ["bundled", "chrono"] }  # SQLite for concurrent stats
+thiserror = "1.0"  # Unified error handling
+dirs = "5.0"  # For finding config directories
+clap = { version = "4.5", features = ["derive"] }  # CLI argument parsing
+log = "0.4"  # Structured logging
+env_logger = "0.11"  # Environment-based log configuration
+regex = "1.10"  # For sanitizing terminal output
+hostname = "0.4"  # For device ID generation
+sha2 = "0.10"  # For stable device ID hashing
+
+# Optional dependencies for turso-sync feature
+libsql = { version = "0.6", optional = true }
+tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "time", "macros"], optional = true }
+
+[build-dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3.8"
+serial_test = "3.1"
+proptest = "1.4"
+
+# Turso sync examples require the turso-sync feature
+[[example]]
+name = "setup_schema"
+required-features = ["turso-sync"]
+
+[[example]]
+name = "inspect_turso_data"
+required-features = ["turso-sync"]
+
+[[example]]
+name = "check_turso_version"
+required-features = ["turso-sync"]
+
+[[example]]
+name = "migrate_turso"
+required-features = ["turso-sync"]
+
+[profile.release]
+opt-level = "z"  # Optimize for size
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"  # Smaller panic handler
+
+[profile.dev]
+opt-level = 0
+debug = true

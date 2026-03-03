@@ -1,0 +1,1348 @@
+//! Utility functions for the statusline.
+//!
+//! This module provides various helper functions for path manipulation,
+//! time parsing, and context usage calculations.
+
+use crate::common::validate_path_security;
+use crate::config;
+use crate::error::{Result, StatuslineError};
+use crate::models::{ContextUsage, TranscriptEntry};
+use chrono::DateTime;
+use std::env;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+/// Static ANSI regex pattern, initialized once
+static ANSI_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+
+/// Sanitizes a string for safe terminal output by removing control characters
+/// and ANSI escape sequences. This prevents malicious strings from manipulating
+/// terminal state or executing unintended commands.
+///
+/// # Arguments
+///
+/// * `input` - The string to sanitize
+///
+/// # Returns
+///
+/// A sanitized string safe for terminal output
+pub fn sanitize_for_terminal(input: &str) -> String {
+    // Remove ANSI escape sequences (e.g., \x1b[31m for colors)
+    // Pattern matches: ESC [ ... m where ... is any sequence of digits and semicolons
+    let ansi_regex = ANSI_REGEX.get_or_init(|| {
+        regex::Regex::new(r"\x1b\[[0-9;]*m").expect("ANSI regex pattern should be valid")
+    });
+    let mut sanitized = ansi_regex.replace_all(input, "").to_string();
+
+    // Remove control characters (0x00-0x1F and 0x7F-0x9F) except for:
+    // - Tab (0x09) - safe for terminal output
+    // NOTE: Newline (\n) and carriage return (\r) are NOT preserved to prevent
+    // terminal injection attacks where malicious paths can inject fake output
+    sanitized = sanitized
+        .chars()
+        .filter(|c| {
+            let code = *c as u32;
+            // Allow printable ASCII and Unicode, plus tab character only
+            (*c == '\t') || (code >= 0x20 && code != 0x7F && !(0x80..=0x9F).contains(&code))
+        })
+        .collect();
+
+    sanitized
+}
+
+/// Parses an ISO 8601 timestamp to Unix epoch seconds.
+///
+/// # Arguments
+///
+/// * `timestamp` - An ISO 8601 formatted timestamp string
+///
+/// # Returns
+///
+/// Returns `Some(u64)` with the Unix timestamp, or `None` if parsing fails.
+pub fn parse_iso8601_to_unix(timestamp: &str) -> Option<u64> {
+    // Use chrono to parse ISO 8601 timestamps
+    // First try parsing as RFC3339 (with timezone)
+    if let Ok(dt) = DateTime::parse_from_rfc3339(timestamp) {
+        return Some(dt.timestamp() as u64);
+    }
+
+    // If no timezone, try parsing as naive datetime and assume UTC
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S%.f") {
+        return Some(dt.and_utc().timestamp() as u64);
+    }
+
+    // Try without fractional seconds
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S") {
+        return Some(dt.and_utc().timestamp() as u64);
+    }
+
+    None
+}
+
+pub fn shorten_path(path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+
+    if let Ok(home) = env::var("HOME") {
+        if path == home {
+            return "~".to_string();
+        }
+        if path.starts_with(&home) {
+            return path.replacen(&home, "~", 1);
+        }
+    }
+    path.to_string()
+}
+
+/// Formats a token count with "k" suffix for thousands
+///
+/// For values under 1000, shows the actual number for precision.
+/// For values 1000+, shows rounded thousands with "k" suffix.
+///
+/// Examples:
+/// - 0 → "0"
+/// - 1 → "1"
+/// - 999 → "999"
+/// - 1234 → "1k"
+/// - 1500 → "2k" (rounds to nearest thousand)
+/// - 179000 → "179k"
+///
+/// # Arguments
+///
+/// * `tokens` - The token count to format
+///
+/// # Returns
+///
+/// A string with the token count, using "k" suffix for values >= 1000
+pub fn format_token_count(tokens: usize) -> String {
+    if tokens < 1000 {
+        tokens.to_string()
+    } else {
+        format!("{}k", (tokens as f64 / 1000.0).round() as usize)
+    }
+}
+
+/// Determines the context window size for a given model
+///
+/// Uses intelligent defaults based on model family and version:
+/// - Sonnet 3.5+, 4.5+: 200k tokens
+/// - Opus 3.5+: 200k tokens
+/// - Older models: 160k tokens
+/// - Unknown models: Config default (200k)
+///
+/// Users can override any model in config.toml [context.model_windows]
+///
+/// # Future Enhancement
+///
+/// **API-based context window queries**: In a future version, we could query
+/// the Anthropic API or a maintained database to get accurate, up-to-date
+/// context window sizes for all models. This would eliminate the need for
+/// hardcoded defaults and manual config updates.
+///
+/// Get learned context window from database (if available and confident)
+fn get_learned_context_window(
+    model_name: &str,
+    config: &config::Config,
+) -> crate::error::Result<Option<usize>> {
+    use crate::common::get_data_dir;
+    use crate::context_learning::ContextLearner;
+    use crate::database::SqliteDatabase;
+
+    let db_path = get_data_dir().join("stats.db");
+    let db = SqliteDatabase::new(&db_path)?;
+    let learner = ContextLearner::new(db);
+
+    learner.get_learned_window(model_name, config.context.learning_confidence_threshold)
+}
+
+/// Potential approaches:
+/// - Query `/v1/models` endpoint (if available) for model metadata
+/// - Maintain a remote JSON file with current context window sizes
+/// - Use a caching strategy to avoid repeated API calls
+/// - Fall back to intelligent defaults if query fails
+///
+/// Trade-offs to consider:
+/// - API latency (would need caching to maintain ~5ms execution time)
+/// - Offline usage (must have fallback)
+/// - API availability and authentication requirements
+///
+/// # Arguments
+///
+/// * `model_name` - Optional model display name from Claude Code
+/// * `config` - Configuration containing window_size defaults and overrides
+///
+/// # Returns
+///
+/// Context window size in tokens
+pub fn get_context_window_for_model(model_name: Option<&str>, config: &config::Config) -> usize {
+    if let Some(model) = model_name {
+        // Priority 1: User config overrides (highest priority)
+        if let Some(&custom_size) = config.context.model_windows.get(model) {
+            return custom_size;
+        }
+
+        // Priority 2: Learned values (if adaptive learning enabled and confident)
+        if config.context.adaptive_learning {
+            if let Ok(Some(window)) = get_learned_context_window(model, config) {
+                return window;
+            }
+        }
+
+        // Priority 3: Check for explicit context window markers in display name
+        // E.g., "Sonnet 4.5 (1M context)" → 1M tokens
+        if model.contains("(1M context)") || model.contains("(1M)") {
+            return 1_000_000;
+        }
+
+        // Priority 4: Smart defaults based on model family and version
+        use crate::models::ModelType;
+        let model_type = ModelType::from_name(model);
+
+        match model_type {
+            ModelType::Model { family, version } => {
+                // Parse version for comparison (handle formats like "3.5", "4.5", "3", etc.)
+                let version_number = version
+                    .split('.')
+                    .next()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(0);
+
+                let minor_version = version
+                    .split('.')
+                    .nth(1)
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(0);
+
+                match family.as_str() {
+                    "Sonnet" => {
+                        // Sonnet 3.5+, 4.x+: 200k tokens
+                        if version_number >= 4 || (version_number == 3 && minor_version >= 5) {
+                            200_000
+                        } else {
+                            160_000
+                        }
+                    }
+                    "Opus" => {
+                        // Opus 3.5+: 200k tokens
+                        if version_number >= 4 || (version_number == 3 && minor_version >= 5) {
+                            200_000
+                        } else {
+                            160_000
+                        }
+                    }
+                    "Haiku" => {
+                        // Haiku models typically have smaller windows
+                        // Future versions might increase, but default to config
+                        config.context.window_size
+                    }
+                    _ => config.context.window_size,
+                }
+            }
+            ModelType::Unknown => config.context.window_size,
+        }
+    } else {
+        // No model name provided, use config default
+        config.context.window_size
+    }
+}
+
+/// Validates that a path is a valid transcript file
+fn validate_transcript_file(path: &str) -> Result<PathBuf> {
+    // Use common validation first
+    let canonical_path = validate_path_security(path)?;
+
+    // Ensure the path is a file (not a directory)
+    if !canonical_path.is_file() {
+        return Err(StatuslineError::invalid_path(format!(
+            "Path is not a file: {}",
+            path
+        )));
+    }
+
+    // Check file extension (case-insensitive)
+    if let Some(ext) = canonical_path.extension() {
+        // Case-insensitive check for jsonl extension
+        if !ext
+            .to_str()
+            .map(|s| s.eq_ignore_ascii_case("jsonl"))
+            .unwrap_or(false)
+        {
+            return Err(StatuslineError::invalid_path(
+                "Only .jsonl files are allowed for transcripts",
+            ));
+        }
+    } else {
+        return Err(StatuslineError::invalid_path(
+            "File must have .jsonl extension",
+        ));
+    }
+
+    // Note: No file size limit needed - we use tail-reading for efficiency
+    // Large files are handled by seeking to the end and reading last N lines only
+
+    Ok(canonical_path)
+}
+
+/// Extract the maximum token count from transcript file.
+/// Returns the highest token count observed across all assistant messages.
+pub fn get_token_count_from_transcript(transcript_path: &str) -> Option<u32> {
+    // Use context_size() (input + cache_read) for context window calculation
+    // These are MAX values representing peak context, not SUMmed values
+    get_token_breakdown_from_transcript(transcript_path).map(|breakdown| breakdown.context_size())
+}
+
+/// Extracts detailed token breakdown from transcript file.
+///
+/// Returns a TokenBreakdown with separate counts for input, output, cache read, and cache creation tokens.
+/// This data is used for cost analysis, cache efficiency tracking, and per-model analytics.
+///
+/// Implementation: Reads from the end of the file for efficiency with large transcripts.
+/// Only processes the last N lines (configured via transcript.buffer_lines).
+pub fn get_token_breakdown_from_transcript(
+    transcript_path: &str,
+) -> Option<crate::models::TokenBreakdown> {
+    use crate::models::TokenBreakdown;
+    use std::io::{Seek, SeekFrom};
+
+    // Validate and canonicalize the file path
+    let safe_path = validate_transcript_file(transcript_path).ok()?;
+
+    // Open file and get size
+    let mut file = File::open(&safe_path).ok()?;
+    let file_size = file.metadata().ok()?.len();
+
+    // Load config once to avoid repeated TOML parsing
+    let config = config::get_config();
+    let buffer_size = config.transcript.buffer_lines;
+
+    // For small files, read normally from start
+    // For large files (>1MB), read from end to avoid processing entire file
+    let lines: Vec<String> = if file_size < 1024 * 1024 {
+        // Small file: read normally
+        let reader = BufReader::new(file);
+        let mut circular_buffer = std::collections::VecDeque::with_capacity(buffer_size);
+        for line in reader.lines().map_while(|l| l.ok()) {
+            if circular_buffer.len() == buffer_size {
+                circular_buffer.pop_front();
+            }
+            circular_buffer.push_back(line);
+        }
+        circular_buffer.into_iter().collect()
+    } else {
+        // Large file: read from end
+        // Estimate: average line ~2KB, read last 200KB to get ~100 lines (buffer for safety)
+        let read_size = (buffer_size * 2048).max(200 * 1024) as u64;
+        let start_pos = file_size.saturating_sub(read_size);
+
+        // Seek to position
+        file.seek(SeekFrom::Start(start_pos)).ok()?;
+
+        // Read from that position
+        let reader = BufReader::new(file);
+        let all_lines: Vec<String> = reader.lines().map_while(|l| l.ok()).collect();
+
+        // Skip first line if we started mid-line (partial line)
+        let skip_first = if start_pos > 0 { 1 } else { 0 };
+
+        // Take last N lines
+        all_lines
+            .into_iter()
+            .skip(skip_first)
+            .rev()
+            .take(buffer_size)
+            .rev()
+            .collect()
+    };
+
+    // Process all assistant messages:
+    // - LAST for context-related tokens (input, cache_read) - represents CURRENT context usage
+    //   This is what users see on the statusline (e.g., "9%" after compaction, not "64%")
+    // - SUM for generated tokens (output, cache_creation) - represents total work done
+    //
+    // IMPORTANT: For compaction detection heuristics (Phase 2), the database tracks
+    // max_tokens_observed separately. This function returns CURRENT values for display.
+    let mut last_input = 0u32;
+    let mut last_cache_read = 0u32;
+    let mut sum_output = 0u32;
+    let mut sum_cache_creation = 0u32;
+    let mut has_data = false;
+
+    for line in lines {
+        if let Ok(entry) = serde_json::from_str::<TranscriptEntry>(&line) {
+            if entry.message.role == "assistant" {
+                if let Some(usage) = entry.message.usage {
+                    has_data = true;
+
+                    // Extract individual token counts
+                    let input = usage.input_tokens.unwrap_or(0);
+                    let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+                    let cache_creation = usage.cache_creation_input_tokens.unwrap_or(0);
+                    let output = usage.output_tokens.unwrap_or(0);
+
+                    // SUM: output and cache_creation (cumulative work done)
+                    sum_output = sum_output.saturating_add(output);
+                    sum_cache_creation = sum_cache_creation.saturating_add(cache_creation);
+
+                    // LAST: input and cache_read (CURRENT context usage for display)
+                    // We overwrite on each iteration to keep only the most recent values
+                    // This ensures the statusline shows current context %, not historical peak
+                    last_input = input;
+                    last_cache_read = cache_read;
+                }
+            }
+        }
+    }
+
+    if has_data {
+        Some(TokenBreakdown {
+            input_tokens: last_input,
+            output_tokens: sum_output,
+            cache_read_tokens: last_cache_read,
+            cache_creation_tokens: sum_cache_creation,
+        })
+    } else {
+        None
+    }
+}
+
+/// Detect compaction state based on token count changes and file modification time
+fn detect_compaction_state(
+    transcript_path: &str,
+    current_tokens: usize,
+    session_id: Option<&str>,
+) -> crate::models::CompactionState {
+    use crate::common::get_data_dir;
+    use crate::database::SqliteDatabase;
+    use crate::models::CompactionState;
+    use std::fs;
+    use std::time::SystemTime;
+
+    // Phase 1: Check for hook-based state (fastest, most accurate)
+    if let Some(sid) = session_id {
+        if let Some(hook_state) = crate::state::read_state(sid) {
+            // Hook state file exists and is fresh (not stale)
+            if hook_state.state == "compacting" {
+                log::debug!(
+                    "Compaction detected via hook (trigger: {})",
+                    hook_state.trigger
+                );
+                return CompactionState::InProgress;
+            }
+        }
+    }
+
+    // Get last known token count from database (only if DB already exists)
+    let last_known_tokens = if let Some(sid) = session_id {
+        let db_path = get_data_dir().join("stats.db");
+        if db_path.exists() {
+            if let Ok(db) = SqliteDatabase::new(&db_path) {
+                db.get_session_max_tokens(sid)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Check file modification time
+    let recently_modified = if let Ok(safe_path) = validate_transcript_file(transcript_path) {
+        if let Ok(metadata) = fs::metadata(&safe_path) {
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(elapsed) = SystemTime::now().duration_since(modified) {
+                    elapsed.as_secs() < 10 // Modified in last 10 seconds
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    // Detect compaction state
+    if let Some(last_tokens) = last_known_tokens {
+        // Check for significant token drop (>50% reduction indicates compaction)
+        let token_drop_ratio = if last_tokens > 0 {
+            (last_tokens.saturating_sub(current_tokens)) as f64 / last_tokens as f64
+        } else {
+            0.0
+        };
+
+        if token_drop_ratio > 0.5 {
+            // Significant drop detected
+            if recently_modified {
+                // File just modified + token drop = compaction in progress
+                log::debug!(
+                    "Compaction in progress: tokens {} -> {} ({:.1}% drop), file modified <10s ago",
+                    last_tokens,
+                    current_tokens,
+                    token_drop_ratio * 100.0
+                );
+                CompactionState::InProgress
+            } else {
+                // Token drop but file not recently modified = recently completed
+                log::debug!(
+                    "Compaction recently completed: tokens {} -> {} ({:.1}% drop)",
+                    last_tokens,
+                    current_tokens,
+                    token_drop_ratio * 100.0
+                );
+                CompactionState::RecentlyCompleted
+            }
+        } else if recently_modified && last_tokens > current_tokens * 2 {
+            // File recently modified but we haven't seen the new token count yet
+            // This happens when Claude is still writing the compacted transcript
+            log::debug!(
+                "Compaction in progress: file modified recently, expecting token drop from {}",
+                last_tokens
+            );
+            CompactionState::InProgress
+        } else {
+            CompactionState::Normal
+        }
+    } else {
+        // No history available, can't detect compaction
+        CompactionState::Normal
+    }
+}
+
+pub fn calculate_context_usage(
+    transcript_path: &str,
+    model_name: Option<&str>,
+    session_id: Option<&str>,
+    config_override: Option<&crate::config::Config>,
+) -> Option<ContextUsage> {
+    let total_tokens = get_token_count_from_transcript(transcript_path)?;
+
+    let config = config_override.unwrap_or_else(|| config::get_config());
+    let buffer_size = config.context.buffer_size;
+
+    // Detect compaction state
+    let compaction_state =
+        detect_compaction_state(transcript_path, total_tokens as usize, session_id);
+
+    // Get base context window from model detection (may be learned or advertised)
+    let base_window = get_context_window_for_model(model_name, config);
+
+    // Interpretation of base_window depends on whether adaptive learning is enabled:
+    // - If adaptive learning ENABLED: base_window is the learned compaction point (e.g., 156K)
+    //   This represents the working window where compaction happens
+    // - If adaptive learning DISABLED: base_window is the advertised total window (e.g., 200K)
+    //   This is the full context window as advertised by Anthropic
+
+    let (full_window, working_window) = if config.context.adaptive_learning {
+        // Adaptive learning enabled: base_window is the compaction point (working window)
+        // full_window = compaction_point + buffer (e.g., 156K + 40K = 196K total)
+        // working_window = compaction_point (e.g., 156K before compaction)
+        (base_window + buffer_size, base_window)
+    } else {
+        // Adaptive learning disabled: base_window is the advertised total window
+        // full_window = advertised total (e.g., 200K)
+        // working_window = advertised total - buffer (e.g., 200K - 40K = 160K)
+        (base_window, base_window.saturating_sub(buffer_size))
+    };
+
+    // Calculate percentage based on configured display mode
+    log::debug!(
+        "Context calculation: mode={}, tokens={}, base_window={}, full_window={}, working_window={}, buffer={}, adaptive_learning={}",
+        config.context.percentage_mode,
+        total_tokens,
+        base_window,
+        full_window,
+        working_window,
+        buffer_size,
+        config.context.adaptive_learning
+    );
+
+    let percentage = match config.context.percentage_mode.as_str() {
+        "working" => {
+            // "working" mode: percentage of working window
+            // - With learning: shows proximity to learned compaction point (e.g., 150K / 156K = 96%)
+            // - Without learning: shows proximity to advertised working window (e.g., 150K / 160K = 94%)
+            let pct = (total_tokens as f64 / working_window as f64) * 100.0;
+            log::debug!(
+                "Using 'working' mode: {} / {} = {:.2}%",
+                total_tokens,
+                working_window,
+                pct
+            );
+            pct
+        }
+        _ => {
+            // "full" mode (default): percentage of total context window
+            // - With learning: uses learned total (compaction + buffer, e.g., 150K / 196K = 77%)
+            // - Without learning: uses advertised total (e.g., 150K / 200K = 75%)
+            let pct = (total_tokens as f64 / full_window as f64) * 100.0;
+            log::debug!(
+                "Using 'full' mode: {} / {} = {:.2}%",
+                total_tokens,
+                full_window,
+                pct
+            );
+            pct
+        }
+    };
+
+    // Tokens remaining in working window before hitting buffer zone
+    let tokens_remaining = working_window.saturating_sub(total_tokens as usize);
+
+    // Check if approaching auto-compact threshold (mode-aware: 75% for "full", 94% for "working")
+    let effective_threshold = config.context.get_effective_threshold();
+    let approaching_limit = percentage >= effective_threshold;
+
+    Some(ContextUsage {
+        percentage: percentage.min(100.0),
+        approaching_limit,
+        tokens_remaining,
+        compaction_state,
+    })
+}
+
+pub fn parse_duration(transcript_path: &str) -> Option<u64> {
+    // Validate and canonicalize the file path
+    let safe_path = validate_transcript_file(transcript_path).ok()?;
+
+    // Read first and last timestamps from transcript efficiently
+    let file = File::open(&safe_path).ok()?;
+    let reader = BufReader::new(file);
+
+    let mut first_timestamp = None;
+    let mut last_timestamp = None;
+    let mut first_line = None;
+
+    // Read lines one at a time, keeping track of first and updating last
+    for line in reader.lines().map_while(|l| l.ok()) {
+        if first_line.is_none() {
+            first_line = Some(line.clone());
+            // Parse first line
+            if let Ok(entry) = serde_json::from_str::<TranscriptEntry>(&line) {
+                first_timestamp = parse_iso8601_to_unix(&entry.timestamp);
+            }
+        }
+
+        // Always try to parse the current line as the last one
+        if let Ok(entry) = serde_json::from_str::<TranscriptEntry>(&line) {
+            last_timestamp = parse_iso8601_to_unix(&entry.timestamp);
+        }
+    }
+
+    if first_timestamp.is_none() || last_timestamp.is_none() {
+        return None;
+    }
+
+    // Calculate duration in seconds
+    match (first_timestamp, last_timestamp) {
+        (Some(first), Some(last)) if last > first => Some(last - first),
+        _ => None, // Can't calculate duration without valid timestamps
+    }
+}
+
+/// Rolling window token rates from transcript
+///
+/// Calculates token rates based on messages within the last `window_seconds` seconds,
+/// providing more responsive rate updates compared to session averages.
+///
+/// Returns `(input_rate, output_rate, cache_read_rate, cache_creation_rate, window_duration)`
+/// where rates are in tokens per second and window_duration is the actual time span covered.
+pub fn get_rolling_window_rates(
+    transcript_path: &str,
+    window_seconds: u64,
+) -> Option<(f64, f64, f64, f64, u64)> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let config = crate::config::get_config();
+    let safe_path = validate_transcript_file(transcript_path).ok()?;
+    let file = File::open(&safe_path).ok()?;
+
+    // Calculate cutoff time (now - window_seconds)
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let cutoff = now.saturating_sub(window_seconds);
+
+    // Read lines in reverse order (most recent first) using circular buffer
+    let reader = BufReader::new(file);
+    let buffer_lines = config.transcript.buffer_lines;
+
+    let mut buffer: std::collections::VecDeque<String> =
+        std::collections::VecDeque::with_capacity(buffer_lines);
+
+    for line in reader.lines().map_while(|l| l.ok()) {
+        if buffer.len() >= buffer_lines {
+            buffer.pop_front();
+        }
+        buffer.push_back(line);
+    }
+
+    // Process messages within the window
+    // Note: For rolling window, we use different logic than session totals:
+    // - SUM for output/cache_creation (cumulative work done in window)
+    // - MAX for input/cache_read (peak context, not cumulative - input shows full context each message)
+    let mut max_input = 0u32;
+    let mut max_cache_read = 0u32;
+    let mut sum_output = 0u32;
+    let mut sum_cache_creation = 0u32;
+    let mut earliest_timestamp: Option<u64> = None;
+    let mut latest_timestamp: Option<u64> = None;
+    let mut has_data = false;
+
+    for line in buffer.iter() {
+        if let Ok(entry) = serde_json::from_str::<TranscriptEntry>(line) {
+            if let Some(ts) = parse_iso8601_to_unix(&entry.timestamp) {
+                // Only include messages within the window
+                if ts >= cutoff {
+                    // Track time span
+                    match earliest_timestamp {
+                        None => earliest_timestamp = Some(ts),
+                        Some(e) if ts < e => earliest_timestamp = Some(ts),
+                        _ => {}
+                    }
+                    match latest_timestamp {
+                        None => latest_timestamp = Some(ts),
+                        Some(l) if ts > l => latest_timestamp = Some(ts),
+                        _ => {}
+                    }
+
+                    // Only assistant messages have usage data
+                    if entry.message.role == "assistant" {
+                        if let Some(usage) = entry.message.usage {
+                            has_data = true;
+                            // MAX for context tokens (input/cache_read represent full context, not delta)
+                            let input = usage.input_tokens.unwrap_or(0);
+                            let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+                            if input > max_input {
+                                max_input = input;
+                            }
+                            if cache_read > max_cache_read {
+                                max_cache_read = cache_read;
+                            }
+                            // SUM for generated tokens (output/cache_creation are cumulative)
+                            sum_output =
+                                sum_output.saturating_add(usage.output_tokens.unwrap_or(0));
+                            sum_cache_creation = sum_cache_creation
+                                .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !has_data {
+        return None;
+    }
+
+    // Calculate actual window duration (use configured window or actual span, whichever is smaller)
+    let actual_span = match (earliest_timestamp, latest_timestamp) {
+        (Some(e), Some(l)) if l > e => l - e,
+        (Some(e), Some(_)) => now.saturating_sub(e), // Single message: use time since message
+        _ => window_seconds,                         // Fall back to configured window
+    };
+
+    // Use the smaller of actual span or configured window, minimum 1 second
+    let effective_duration = actual_span.min(window_seconds).max(1);
+
+    let duration_f64 = effective_duration as f64;
+
+    // For rolling window:
+    // - Output rate: tokens generated per second (meaningful)
+    // - Cache creation rate: cache writes per second (meaningful)
+    // - Input/cache_read "rate": Not meaningful as a rate (context size != generation rate)
+    //   We return 0 for these to signal they shouldn't be displayed as rates
+    let output_rate = sum_output as f64 / duration_f64;
+    let cache_creation_rate = sum_cache_creation as f64 / duration_f64;
+
+    // Input/cache_read are returned as 0 since "tokens per second" doesn't apply to context size
+    // The session totals (from database) still show accurate input metrics
+    let input_rate = 0.0;
+    let cache_read_rate = 0.0;
+
+    Some((
+        input_rate,
+        output_rate,
+        cache_read_rate,
+        cache_creation_rate,
+        effective_duration,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test helper: Create deterministic config for testing
+    // Uses default config with known values:
+    // - adaptive_learning: false
+    // - percentage_mode: "full"
+    // - buffer_size: 40000
+    // - context_window (via model defaults): 200000
+    fn test_config() -> crate::config::Config {
+        crate::config::Config::default()
+    }
+    use std::fs;
+
+    #[test]
+    fn test_validate_transcript_file_security() {
+        // Test null byte injection
+        assert!(validate_transcript_file("/tmp/test\0.jsonl").is_err());
+        assert!(validate_transcript_file("/tmp\0/test.jsonl").is_err());
+
+        // Test non-existent files
+        assert!(validate_transcript_file("/definitely/does/not/exist.jsonl").is_err());
+
+        // Test directory instead of file
+        let temp_dir = std::env::temp_dir();
+        assert!(validate_transcript_file(temp_dir.to_str().unwrap()).is_err());
+
+        // Test non-jsonl file
+        let temp_file = std::env::temp_dir().join("test.txt");
+        fs::write(&temp_file, "test").ok();
+        assert!(validate_transcript_file(temp_file.to_str().unwrap()).is_err());
+        fs::remove_file(temp_file).ok();
+
+        // Test case-insensitive extension (should accept .JSONL, .JsonL, etc.)
+        use tempfile::NamedTempFile;
+        let temp_file = NamedTempFile::new().unwrap();
+        let path_upper = temp_file.path().with_extension("JSONL");
+        fs::write(&path_upper, "test").ok();
+        assert!(validate_transcript_file(path_upper.to_str().unwrap()).is_ok());
+        fs::remove_file(path_upper).ok();
+    }
+
+    #[test]
+    fn test_malicious_transcript_paths() {
+        let cfg = test_config();
+
+        // Directory traversal attempts
+        assert!(calculate_context_usage("../../../etc/passwd", None, None, Some(&cfg)).is_none());
+        assert!(parse_duration("../../../../../../etc/shadow").is_none());
+
+        // Command injection attempts
+        assert!(
+            calculate_context_usage("/tmp/test.jsonl; rm -rf /", None, None, Some(&cfg)).is_none()
+        );
+        assert!(parse_duration("/tmp/test.jsonl && echo hacked").is_none());
+        assert!(calculate_context_usage(
+            "/tmp/test.jsonl | cat /etc/passwd",
+            None,
+            None,
+            Some(&cfg)
+        )
+        .is_none());
+        assert!(parse_duration("/tmp/test.jsonl`whoami`").is_none());
+        assert!(
+            calculate_context_usage("/tmp/test.jsonl$(whoami)", None, None, Some(&cfg)).is_none()
+        );
+
+        // Null byte injection
+        assert!(calculate_context_usage("/tmp/test\0.jsonl", None, None, Some(&cfg)).is_none());
+        assert!(parse_duration("/tmp\0/test.jsonl").is_none());
+
+        // Special characters that might cause issues
+        assert!(calculate_context_usage("/tmp/test\n.jsonl", None, None, Some(&cfg)).is_none());
+        assert!(parse_duration("/tmp/test\r.jsonl").is_none());
+    }
+
+    #[test]
+    fn test_sanitize_for_terminal() {
+        // Test removal of ANSI escape codes
+        assert_eq!(sanitize_for_terminal("\x1b[31mRed Text\x1b[0m"), "Red Text");
+        assert_eq!(
+            sanitize_for_terminal("\x1b[1;32mBold Green\x1b[0m"),
+            "Bold Green"
+        );
+
+        // Test removal of control characters
+        assert_eq!(
+            sanitize_for_terminal("Hello\x00World"), // Null byte
+            "HelloWorld"
+        );
+        assert_eq!(
+            sanitize_for_terminal("Text\x1bEscape"), // Escape character alone
+            "TextEscape"
+        );
+        assert_eq!(
+            sanitize_for_terminal("Bell\x07Sound"), // Bell character
+            "BellSound"
+        );
+
+        // Test removal of newlines and carriage returns (security: prevent terminal injection)
+        assert_eq!(
+            sanitize_for_terminal("Line1\nLine2\tTabbed"),
+            "Line1Line2\tTabbed" // \n removed, \t preserved
+        );
+        assert_eq!(
+            sanitize_for_terminal("Windows\r\nLineEnd"),
+            "WindowsLineEnd" // Both \r and \n removed
+        );
+
+        // Test complex mixed input (newline removed for security)
+        assert_eq!(
+            sanitize_for_terminal("\x1b[31mDanger\x00\x07\x1b[0m\nSafe"),
+            "DangerSafe" // \n removed to prevent terminal injection
+        );
+
+        // Test Unicode characters are preserved
+        assert_eq!(
+            sanitize_for_terminal("Unicode: 🚀 日本語"),
+            "Unicode: 🚀 日本語"
+        );
+
+        // Test removal of non-printable Unicode control characters
+        assert_eq!(
+            sanitize_for_terminal("Text\u{0080}\u{009F}More"), // C1 control characters
+            "TextMore"
+        );
+    }
+
+    #[test]
+    fn test_shorten_path() {
+        let home = env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
+
+        // Test home directory substitution
+        let path = format!("{}/projects/test", home);
+        assert_eq!(shorten_path(&path), "~/projects/test");
+
+        // Test path that doesn't start with home
+        assert_eq!(shorten_path("/usr/local/bin"), "/usr/local/bin");
+
+        // Test exact home directory
+        assert_eq!(shorten_path(&home), "~");
+
+        // Test empty path
+        assert_eq!(shorten_path(""), "");
+    }
+
+    #[test]
+    fn test_context_usage_levels() {
+        use crate::models::CompactionState;
+        // Test various percentage levels with approaching_limit logic
+        let low = ContextUsage {
+            percentage: 10.0,
+            approaching_limit: false,
+            tokens_remaining: 180_000,
+            compaction_state: CompactionState::Normal,
+        };
+        let medium = ContextUsage {
+            percentage: 55.0,
+            approaching_limit: false,
+            tokens_remaining: 90_000,
+            compaction_state: CompactionState::Normal,
+        };
+        let high = ContextUsage {
+            percentage: 75.0,
+            approaching_limit: false,
+            tokens_remaining: 50_000,
+            compaction_state: CompactionState::Normal,
+        };
+        let critical = ContextUsage {
+            percentage: 95.0,
+            approaching_limit: true, // Above 80% threshold
+            tokens_remaining: 10_000,
+            compaction_state: CompactionState::Normal,
+        };
+
+        assert_eq!(low.percentage, 10.0);
+        assert!(!low.approaching_limit);
+
+        assert_eq!(medium.percentage, 55.0);
+        assert!(!medium.approaching_limit);
+
+        assert_eq!(high.percentage, 75.0);
+        assert!(!high.approaching_limit);
+
+        assert_eq!(critical.percentage, 95.0);
+        assert!(critical.approaching_limit); // Should warn at 95%
+    }
+
+    #[test]
+    fn test_calculate_context_usage() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Test with non-existent file
+        let cfg = test_config();
+        assert!(
+            calculate_context_usage("/tmp/nonexistent.jsonl", None, None, Some(&cfg)).is_none()
+        );
+
+        // Test with valid transcript (string timestamp and string content)
+        let mut file = NamedTempFile::with_suffix(".jsonl").unwrap();
+        writeln!(file, r#"{{"message":{{"role":"assistant","content":"test","usage":{{"input_tokens":120000,"output_tokens":5000}}}},"timestamp":"2025-08-22T18:32:37.789Z"}}"#).unwrap();
+        writeln!(file, r#"{{"message":{{"role":"user","content":"question"}},"timestamp":"2025-08-22T18:33:00.000Z"}}"#).unwrap();
+
+        let cfg = test_config();
+        let result = calculate_context_usage(file.path().to_str().unwrap(), None, None, Some(&cfg));
+        assert!(result.is_some());
+        let usage = result.unwrap();
+
+        // Context tokens (input + cache_read): 120000 + 0 = 120000
+        // With test config (200K full mode, no adaptive learning): 120000 / 200000 = 60%
+        // Note: output_tokens (5000) are excluded from context window calculation
+        assert_eq!(usage.percentage, 60.0);
+    }
+
+    #[test]
+    fn test_calculate_context_usage_with_cache_tokens() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Test with cache tokens
+        let mut file = NamedTempFile::with_suffix(".jsonl").unwrap();
+        writeln!(file, r#"{{"message":{{"role":"assistant","content":"test","usage":{{"input_tokens":100,"cache_read_input_tokens":30000,"cache_creation_input_tokens":200,"output_tokens":500}}}},"timestamp":"2025-08-22T18:32:37.789Z"}}"#).unwrap();
+
+        let cfg = test_config();
+        let result = calculate_context_usage(file.path().to_str().unwrap(), None, None, Some(&cfg));
+        assert!(result.is_some());
+        let usage = result.unwrap();
+
+        // Context tokens (input + cache_read): 100 + 30000 = 30100
+        // With test config (200K full mode): 30100 / 200000 = 15.05%
+        // Note: output (500) and cache_creation (200) are excluded from context window
+        assert!((usage.percentage - 15.05).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_calculate_context_usage_with_array_content() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Test with array content (assistant messages often have this)
+        let mut file = NamedTempFile::with_suffix(".jsonl").unwrap();
+        writeln!(file, r#"{{"message":{{"role":"assistant","content":[{{"type":"text","text":"response"}}],"usage":{{"input_tokens":50000,"output_tokens":1000}}}},"timestamp":"2025-08-22T18:32:37.789Z"}}"#).unwrap();
+
+        let cfg = test_config();
+        let result = calculate_context_usage(file.path().to_str().unwrap(), None, None, Some(&cfg));
+        assert!(result.is_some());
+        let usage = result.unwrap();
+
+        // Context tokens (input + cache_read): 50000 + 0 = 50000
+        // With test config (200K full mode): 50000 / 200000 = 25%
+        // Note: output_tokens (1000) are excluded from context window calculation
+        assert_eq!(usage.percentage, 25.0);
+    }
+
+    #[test]
+    fn test_parse_iso8601_to_unix() {
+        // Test valid ISO 8601 timestamps
+        assert_eq!(
+            parse_iso8601_to_unix("2025-08-25T10:00:00.000Z").unwrap(),
+            parse_iso8601_to_unix("2025-08-25T10:00:00.000Z").unwrap()
+        );
+
+        // Test that timestamps 5 minutes apart give 300 seconds difference
+        let t1 = parse_iso8601_to_unix("2025-08-25T10:00:00.000Z").unwrap();
+        let t2 = parse_iso8601_to_unix("2025-08-25T10:05:00.000Z").unwrap();
+        assert_eq!(t2 - t1, 300);
+
+        // Test that timestamps 1 hour apart give 3600 seconds difference
+        let t3 = parse_iso8601_to_unix("2025-08-25T10:00:00.000Z").unwrap();
+        let t4 = parse_iso8601_to_unix("2025-08-25T11:00:00.000Z").unwrap();
+        assert_eq!(t4 - t3, 3600);
+
+        // Test with milliseconds
+        assert!(parse_iso8601_to_unix("2025-08-25T10:00:00.123Z").is_some());
+
+        // Test invalid formats
+        assert!(parse_iso8601_to_unix("2025-08-25 10:00:00").is_none()); // No T separator
+        assert!(parse_iso8601_to_unix("2025-08-25T10:00:00").is_some()); // No Z suffix - should still parse
+        assert!(parse_iso8601_to_unix("not a timestamp").is_none());
+    }
+
+    #[test]
+    fn test_parse_duration() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Test with non-existent file
+        assert!(parse_duration("/tmp/nonexistent.jsonl").is_none());
+
+        // Test with valid transcript (using string timestamps)
+        let mut file = NamedTempFile::with_suffix(".jsonl").unwrap();
+        writeln!(file, r#"{{"message":{{"role":"assistant","content":"test"}},"timestamp":"2025-08-22T18:00:00.000Z"}}"#).unwrap();
+        writeln!(file, r#"{{"message":{{"role":"user","content":"question"}},"timestamp":"2025-08-22T19:00:00.000Z"}}"#).unwrap();
+
+        let result = parse_duration(file.path().to_str().unwrap());
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), 3600); // 1 hour between 18:00:00 and 19:00:00
+
+        // Test with single line (should return None)
+        let mut file2 = NamedTempFile::with_suffix(".jsonl").unwrap();
+        writeln!(file2, r#"{{"message":{{"role":"assistant","content":"test"}},"timestamp":"2025-08-22T18:00:00.000Z"}}"#).unwrap();
+
+        let result2 = parse_duration(file2.path().to_str().unwrap());
+        assert!(result2.is_none());
+    }
+
+    #[test]
+    fn test_parse_duration_with_realistic_timestamps() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Test 5-minute session (the case that was showing $399/hr)
+        let mut file = NamedTempFile::with_suffix(".jsonl").unwrap();
+        writeln!(file, r#"{{"message":{{"role":"user","content":"Hello"}},"timestamp":"2025-08-25T10:00:00.000Z"}}"#).unwrap();
+        writeln!(file, r#"{{"message":{{"role":"assistant","content":"Hi","usage":{{"input_tokens":100,"output_tokens":50}}}},"timestamp":"2025-08-25T10:05:00.000Z"}}"#).unwrap();
+
+        let result = parse_duration(file.path().to_str().unwrap());
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), 300); // 5 minutes = 300 seconds
+
+        // Test 10-minute session
+        let mut file2 = NamedTempFile::with_suffix(".jsonl").unwrap();
+        writeln!(file2, r#"{{"message":{{"role":"user","content":"Start"}},"timestamp":"2025-08-25T10:00:00.000Z"}}"#).unwrap();
+        writeln!(file2, r#"{{"message":{{"role":"assistant","content":"Working"}},"timestamp":"2025-08-25T10:10:00.000Z"}}"#).unwrap();
+
+        let result2 = parse_duration(file2.path().to_str().unwrap());
+        assert!(result2.is_some());
+        assert_eq!(result2.unwrap(), 600); // 10 minutes = 600 seconds
+    }
+
+    #[test]
+    fn test_model_based_context_window() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Create a test file with 100k tokens
+        let mut file = NamedTempFile::with_suffix(".jsonl").unwrap();
+        writeln!(file, r#"{{"message":{{"role":"assistant","content":"test","usage":{{"input_tokens":100000,"output_tokens":0}}}},"timestamp":"2025-08-22T18:32:37.789Z"}}"#).unwrap();
+
+        // Total: 100000 tokens
+        // Sonnet 4.5: 100000 / 200000 = 50.0% (standard 200k window)
+        // Sonnet 4.5 (1M context): 100000 / 1000000 = 10.0% (extended 1M window)
+        // Sonnet 3.5/Opus 3.5: 100000 / 200000 = 50.0%
+
+        let cfg = test_config();
+
+        // Test Sonnet 4.5 standard (200k window)
+        let result = calculate_context_usage(
+            file.path().to_str().unwrap(),
+            Some("Claude Sonnet 4.5"),
+            None,
+            Some(&cfg),
+        );
+        assert!(result.is_some());
+        let usage = result.unwrap();
+        assert_eq!(usage.percentage, 50.0);
+
+        // Test Sonnet 4.5 with 1M context (1M window)
+        let result = calculate_context_usage(
+            file.path().to_str().unwrap(),
+            Some("Sonnet 4.5 (1M context)"),
+            None,
+            Some(&cfg),
+        );
+        assert!(result.is_some());
+        let usage = result.unwrap();
+        assert_eq!(usage.percentage, 10.0);
+
+        // Test Sonnet 3.5 (200k window)
+        let result = calculate_context_usage(
+            file.path().to_str().unwrap(),
+            Some("Claude 3.5 Sonnet"),
+            None,
+            Some(&cfg),
+        );
+        assert!(result.is_some());
+        let usage = result.unwrap();
+        assert_eq!(usage.percentage, 50.0);
+
+        // Test Opus 3.5 (200k window)
+        let result = calculate_context_usage(
+            file.path().to_str().unwrap(),
+            Some("Claude 3.5 Opus"),
+            None,
+            Some(&cfg),
+        );
+        assert!(result.is_some());
+        let usage = result.unwrap();
+        assert_eq!(usage.percentage, 50.0);
+
+        // Test unknown model (default 200k window)
+        let result = calculate_context_usage(file.path().to_str().unwrap(), None, None, Some(&cfg));
+        assert!(result.is_some());
+        let usage = result.unwrap();
+        assert_eq!(usage.percentage, 50.0);
+    }
+
+    #[test]
+    fn test_format_token_count() {
+        // Test zero
+        assert_eq!(format_token_count(0), "0");
+
+        // Test values < 1000 show actual numbers for precision
+        assert_eq!(format_token_count(1), "1");
+        assert_eq!(format_token_count(100), "100");
+        assert_eq!(format_token_count(500), "500");
+        assert_eq!(format_token_count(999), "999");
+
+        // Test values >= 1000 use "k" suffix with rounding
+        assert_eq!(format_token_count(1234), "1k"); // Rounds down
+        assert_eq!(format_token_count(1500), "2k"); // Rounds up
+
+        // Test typical values
+        assert_eq!(format_token_count(179000), "179k");
+        assert_eq!(format_token_count(200000), "200k");
+        assert_eq!(format_token_count(1000000), "1000k");
+    }
+
+    #[test]
+    fn test_context_percentage_full_mode_with_adaptive_learning() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Create a transcript with 150K tokens
+        let mut file = NamedTempFile::with_suffix(".jsonl").unwrap();
+        writeln!(file, r#"{{"message":{{"role":"assistant","content":"test","usage":{{"input_tokens":150000,"output_tokens":0}}}},"timestamp":"2025-08-22T18:32:37.789Z"}}"#).unwrap();
+
+        // Create config with adaptive_learning enabled and "full" mode
+        // Simulate a learned context window of 156K (compaction point)
+        // With full mode: percentage = 150K / (156K + 40K buffer) = 150K / 196K ≈ 76.53%
+        let mut cfg = crate::config::Config::default();
+        cfg.context.adaptive_learning = true;
+        cfg.context.percentage_mode = "full".to_string();
+        cfg.context.buffer_size = 40_000;
+        // Set a model window override to simulate learned value of 156K
+        cfg.context
+            .model_windows
+            .insert("Test Model".to_string(), 156_000);
+
+        let result = calculate_context_usage(
+            file.path().to_str().unwrap(),
+            Some("Test Model"),
+            None,
+            Some(&cfg),
+        );
+        assert!(result.is_some());
+        let usage = result.unwrap();
+
+        // With adaptive learning + full mode:
+        // full_window = base_window (156K) + buffer_size (40K) = 196K
+        // percentage = 150K / 196K ≈ 76.53%
+        let expected = (150_000.0 / 196_000.0) * 100.0;
+        assert!(
+            (usage.percentage - expected).abs() < 0.01,
+            "Expected ~{:.2}% but got {:.2}%",
+            expected,
+            usage.percentage
+        );
+    }
+
+    #[test]
+    fn test_context_percentage_working_mode_with_adaptive_learning() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Create a transcript with 150K tokens
+        let mut file = NamedTempFile::with_suffix(".jsonl").unwrap();
+        writeln!(file, r#"{{"message":{{"role":"assistant","content":"test","usage":{{"input_tokens":150000,"output_tokens":0}}}},"timestamp":"2025-08-22T18:32:37.789Z"}}"#).unwrap();
+
+        // Create config with adaptive_learning enabled and "working" mode
+        // Simulate a learned context window of 156K (compaction point)
+        // With working mode: percentage = 150K / 156K ≈ 96.15%
+        let mut cfg = crate::config::Config::default();
+        cfg.context.adaptive_learning = true;
+        cfg.context.percentage_mode = "working".to_string();
+        cfg.context.buffer_size = 40_000;
+        // Set a model window override to simulate learned value of 156K
+        cfg.context
+            .model_windows
+            .insert("Test Model".to_string(), 156_000);
+
+        let result = calculate_context_usage(
+            file.path().to_str().unwrap(),
+            Some("Test Model"),
+            None,
+            Some(&cfg),
+        );
+        assert!(result.is_some());
+        let usage = result.unwrap();
+
+        // With adaptive learning + working mode:
+        // working_window = base_window (156K) - no buffer subtraction for working mode
+        // percentage = 150K / 156K ≈ 96.15%
+        let expected = (150_000.0 / 156_000.0) * 100.0;
+        assert!(
+            (usage.percentage - expected).abs() < 0.01,
+            "Expected ~{:.2}% but got {:.2}%",
+            expected,
+            usage.percentage
+        );
+    }
+
+    #[test]
+    fn test_context_percentage_modes_differ_with_adaptive_learning() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Create a transcript with 150K tokens
+        let mut file = NamedTempFile::with_suffix(".jsonl").unwrap();
+        writeln!(file, r#"{{"message":{{"role":"assistant","content":"test","usage":{{"input_tokens":150000,"output_tokens":0}}}},"timestamp":"2025-08-22T18:32:37.789Z"}}"#).unwrap();
+
+        // Test that full and working modes give DIFFERENT percentages
+        // when adaptive learning is enabled (this is the expected behavior)
+
+        // Full mode config
+        let mut full_cfg = crate::config::Config::default();
+        full_cfg.context.adaptive_learning = true;
+        full_cfg.context.percentage_mode = "full".to_string();
+        full_cfg.context.buffer_size = 40_000;
+        full_cfg
+            .context
+            .model_windows
+            .insert("Test Model".to_string(), 156_000);
+
+        // Working mode config
+        let mut working_cfg = crate::config::Config::default();
+        working_cfg.context.adaptive_learning = true;
+        working_cfg.context.percentage_mode = "working".to_string();
+        working_cfg.context.buffer_size = 40_000;
+        working_cfg
+            .context
+            .model_windows
+            .insert("Test Model".to_string(), 156_000);
+
+        let full_result = calculate_context_usage(
+            file.path().to_str().unwrap(),
+            Some("Test Model"),
+            None,
+            Some(&full_cfg),
+        );
+        let working_result = calculate_context_usage(
+            file.path().to_str().unwrap(),
+            Some("Test Model"),
+            None,
+            Some(&working_cfg),
+        );
+
+        assert!(full_result.is_some());
+        assert!(working_result.is_some());
+
+        let full_pct = full_result.unwrap().percentage;
+        let working_pct = working_result.unwrap().percentage;
+
+        // Full mode: 150K / 196K ≈ 76.53%
+        // Working mode: 150K / 156K ≈ 96.15%
+        // They should be significantly different
+        assert!(
+            (working_pct - full_pct).abs() > 10.0,
+            "Full mode ({:.2}%) and working mode ({:.2}%) should differ significantly with adaptive learning",
+            full_pct,
+            working_pct
+        );
+
+        // Working mode should show higher percentage (closer to compaction)
+        assert!(
+            working_pct > full_pct,
+            "Working mode should show higher percentage than full mode"
+        );
+    }
+}
