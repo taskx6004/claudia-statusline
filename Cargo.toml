@@ -4,7 +4,7 @@ version = "2.22.1"
 edition = "2021"
 license = "MIT"
 description = "Claudia Statusline - A feature-rich statusline for Claude Code, inspired by Peter Steinberger's statusline.rs"
-repository = "https://github.com/hagan/claudia-statusline"
+repository = "https://github.com/taskx6004/claudia-statusline"
 build = "build.rs"
 
 [features]
